@@ -1,0 +1,158 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------
+// ENUMS
+// ------------------------------------------------------
+
+enum Role {
+  ADMIN
+  HEAD_DRIVER
+  DRIVER
+  INSTRUCTOR
+  PASSENGER
+}
+
+enum VehicleStatus {
+  ACTIVE
+  MAINTENANCE
+  INACTIVE
+}
+
+enum TripStatus {
+  SCHEDULED
+  ONGOING
+  COMPLETED
+  CANCELLED
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+}
+
+// ------------------------------------------------------
+// MODELS
+// ------------------------------------------------------
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  fullName  String
+  phone     String?
+  role      Role
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  refreshTokens   RefreshToken[]
+  bookings        Booking[]        @relation("PassengerBookings")
+  driverTrips     Trip[]           @relation("DriverTrips")
+  ownedVehicle    Vehicle?         @relation("VehicleDriver")
+  evaluationsGiven    TrainingRecord[] @relation("InstructorEvaluations")
+  evaluationsReceived TrainingRecord[] @relation("DriverEvaluations")
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@map("refresh_tokens")
+}
+
+model Vehicle {
+  id          String        @id @default(uuid())
+  plateNumber String        @unique
+  type        String // e.g. "Bus", "Van", "Sedan"
+  capacity    Int
+  status      VehicleStatus @default(ACTIVE)
+
+  // A vehicle is assigned to one driver (optional, can be unassigned)
+  driverId String? @unique
+  driver   User?   @relation("VehicleDriver", fields: [driverId], references: [id])
+
+  trips     Trip[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("vehicles")
+}
+
+model Route {
+  id                String   @id @default(uuid())
+  origin            String
+  destination       String
+  distanceKm        Float?
+  estimatedDuration Int? // in minutes
+  trips             Trip[]
+  createdAt         DateTime @default(now())
+
+  @@map("routes")
+}
+
+model Trip {
+  id             String     @id @default(uuid())
+  routeId        String
+  route          Route      @relation(fields: [routeId], references: [id])
+  vehicleId      String
+  vehicle        Vehicle    @relation(fields: [vehicleId], references: [id])
+  driverId       String
+  driver         User       @relation("DriverTrips", fields: [driverId], references: [id])
+  departureTime  DateTime
+  arrivalTime    DateTime?
+  status         TripStatus @default(SCHEDULED)
+  totalSeats     Int
+  availableSeats Int
+  pricePerSeat   Decimal    @db.Decimal(10, 2)
+
+  bookings  Booking[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@map("trips")
+}
+
+model Booking {
+  id          String        @id @default(uuid())
+  tripId      String
+  trip        Trip          @relation(fields: [tripId], references: [id])
+  passengerId String
+  passenger   User          @relation("PassengerBookings", fields: [passengerId], references: [id])
+  seatNumber  Int?
+  status      BookingStatus @default(PENDING)
+  price       Decimal       @db.Decimal(10, 2)
+  bookedAt    DateTime      @default(now())
+
+  @@map("bookings")
+}
+
+// Instructor evaluates/trains drivers - adjust fields to match your real workflow
+model TrainingRecord {
+  id             String   @id @default(uuid())
+  driverId       String
+  driver         User     @relation("DriverEvaluations", fields: [driverId], references: [id])
+  instructorId   String
+  instructor     User     @relation("InstructorEvaluations", fields: [instructorId], references: [id])
+  evaluationDate DateTime @default(now())
+  score          Int? // e.g. 0-100
+  notes          String?
+  createdAt      DateTime @default(now())
+
+  @@map("training_records")
+}
