@@ -10,7 +10,10 @@ async function register(req, res, next) {
       });
     }
 
-    const validRoles = ["ADMIN", "HEAD_DRIVER", "DRIVER", "INSTRUCTOR", "PASSENGER"];
+    // ADMIN is assigned manually in the database. HEAD_DRIVER is assigned
+    // only by an Admin promoting an existing approved Driver — neither is
+    // ever self-registered through the app.
+    const validRoles = ["DRIVER", "FACULTY", "STAFF", "SSG_PRESIDENT"];
     if (!validRoles.includes(role)) {
       return res.status(400).json({ message: `role must be one of: ${validRoles.join(", ")}` });
     }
@@ -24,12 +27,12 @@ async function register(req, res, next) {
 
 async function login(req, res, next) {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ message: "email and password are required" });
+    const { identifier, password } = req.body;
+    if (!identifier || !password) {
+      return res.status(400).json({ message: "identifier and password are required" });
     }
 
-    const result = await authService.login({ email, password });
+    const result = await authService.login({ identifier, password });
     res.json(result);
   } catch (err) {
     next(err);

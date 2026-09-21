@@ -1,4 +1,5 @@
 const express = require("express");
+const path = require("path")
 const cors = require("cors");
 const helmet = require("helmet");
 const morgan = require("morgan");
@@ -12,6 +13,7 @@ app.use(helmet());
 app.use(cors()); // tighten this to your Flutter web origin(s) before production
 app.use(morgan("dev"));
 app.use(express.json());
+app.use("/uploads", express.static(path.join(__dirname, "../uploads")));
 
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 

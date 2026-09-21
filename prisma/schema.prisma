@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
 }
 
 datasource db {
@@ -13,30 +14,48 @@ datasource db {
 
 enum Role {
   ADMIN
-  HEAD_DRIVER
+  HEAD_DRIVER // a driver who can ALSO approve trips (only one at a time)
   DRIVER
-  INSTRUCTOR
-  PASSENGER
+  FACULTY // also covers "Visiting Lecturer" — same role, just a label
+  STAFF
+  SSG_PRESIDENT
 }
 
 enum VehicleStatus {
-  ACTIVE
+  ACTIVE // available for use
+  ON_TRIP
   MAINTENANCE
-  INACTIVE
+  INACTIVE // retired / not in service
 }
 
-enum TripStatus {
-  SCHEDULED
-  ONGOING
-  COMPLETED
-  CANCELLED
+enum DriverStatus {
+  AVAILABLE
+  ON_TRIP
+  OFF_DUTY // set by Admin only
 }
 
-enum BookingStatus {
-  PENDING
-  CONFIRMED
-  CANCELLED
-  COMPLETED
+enum TripRequestStatus {
+  PENDING              // just submitted by requester
+  ADMIN_APPROVED       // Admin approved, waiting for Head Driver
+  HEAD_DRIVER_APPROVED // waiting for the assigned driver to Accept/Decline
+                       // (Head Driver step is skipped when he is the assigned driver)
+  DRIVER_ACCEPTED      // driver accepted, waiting for departure
+  DRIVER_DECLINED      // driver declined, waiting for Head Driver to pick a new driver
+  REJECTED             // rejected by Admin or Head Driver — see rejectedBy/At/Reason
+  ONGOING              // departure log has been recorded
+  COMPLETED            // return log has been recorded
+}
+
+// How the driver serves the trip — decides how busy windows are calculated.
+enum ServiceMode {
+  WAIT            // driver stays with passengers: busy from departure to return
+  DROP_AND_PICKUP // driver drops off, returns to base, comes back at pickupTime
+}
+
+enum StopType {
+  ORIGIN
+  STOP
+  DESTINATION
 }
 
 // ------------------------------------------------------
@@ -44,25 +63,67 @@ enum BookingStatus {
 // ------------------------------------------------------
 
 model User {
-  id        String   @id @default(uuid())
-  email     String   @unique
-  password  String
-  fullName  String
-  phone     String?
-  role      Role
-  isActive  Boolean  @default(true)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id         String   @id @default(uuid())
+  email      String   @unique
+  password   String
+  fullName   String
+  phone      String?
+  avatarUrl  String?
+  role       Role
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  isApproved Boolean  @default(true) // Drivers start false until Admin approves; every other role is true immediately
 
-  // Relations
-  refreshTokens   RefreshToken[]
-  bookings        Booking[]        @relation("PassengerBookings")
-  driverTrips     Trip[]           @relation("DriverTrips")
-  ownedVehicle    Vehicle?         @relation("VehicleDriver")
+  departmentId String?
+  department   Department? @relation(fields: [departmentId], references: [id])
+
+  // Driver-specific data lives in its own table (see DriverProfile) so this
+  // model stays relevant to every role, not just drivers.
+  driverProfile DriverProfile?
+
+  requestedTrips TripRequest[] @relation("Requester")
+  driverTrips    TripRequest[] @relation("DriverTrips")
+
+  ownedVehicle Vehicle? @relation("VehicleDriver")
+
+  adminApprovals      TripRequest[] @relation("AdminApprovals")
+  headDriverApprovals TripRequest[] @relation("HeadDriverApprovals")
+  rejectedTrips       TripRequest[] @relation("RejectedTrips")
+
+  driverDeclines TripDriverDecline[] @relation("DriverDeclines")
+
+  ratingsGiven    Rating[] @relation("RatingsGiven")
+  ratingsReceived Rating[] @relation("RatingsReceived")
+
+  notifications       Notification[]
+  refreshTokenRecords RefreshToken[]
+
   evaluationsGiven    TrainingRecord[] @relation("InstructorEvaluations")
   evaluationsReceived TrainingRecord[] @relation("DriverEvaluations")
 
+  settingsUpdated SystemSettings[] @relation("SettingsUpdatedBy")
+
+  @@index([role])
+  @@index([departmentId])
   @@map("users")
+}
+
+// Driver-only data, kept separate from User to avoid null-heavy columns
+// on every other role. One row per user with role = DRIVER or HEAD_DRIVER.
+model DriverProfile {
+  id            String       @id @default(uuid())
+  userId        String       @unique
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  driverCode    String       @unique // e.g. "DRV-2024-012"
+  status        DriverStatus @default(AVAILABLE)
+  licenseNumber String?
+  dateHired     DateTime?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  @@index([status])
+  @@map("driver_profiles")
 }
 
 model RefreshToken {
@@ -73,76 +134,296 @@ model RefreshToken {
   expiresAt DateTime
   createdAt DateTime @default(now())
 
+  @@index([userId])
   @@map("refresh_tokens")
 }
 
-model Vehicle {
-  id          String        @id @default(uuid())
-  plateNumber String        @unique
-  type        String // e.g. "Bus", "Van", "Sedan"
-  capacity    Int
-  status      VehicleStatus @default(ACTIVE)
+// Fixed list of departments (CCS, CTED, High School, SCIE, CBA, CAF-SOE, etc.)
+// managed as data, not free text, so requests and analytics stay consistent.
+model Department {
+  id        String   @id @default(uuid())
+  name      String   @unique // e.g. "College of Computer Studies"
+  code      String   @unique // e.g. "CCS"
+  createdAt DateTime @default(now())
 
-  // A vehicle is assigned to one driver (optional, can be unassigned)
+  users        User[]
+  tripRequests TripRequest[]
+
+  @@map("departments")
+}
+
+// Admin-managed list of destinations with a fixed one-way travel time
+// from base (Katipunan). Used to calculate a driver's busy windows.
+model Location {
+  id            String   @id @default(uuid())
+  name          String   @unique // e.g. "Dapitan", "Ipil"
+  travelMinutes Int // one-way travel time from Katipunan, in minutes
+  isActive      Boolean  @default(true) // hide from dropdowns without deleting
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Reserved for the future GPS feature (geofencing). Unused for now.
+  latitude     Float?
+  longitude    Float?
+  radiusMeters Int?
+
+  stops TripStop[]
+
+  @@map("locations")
+}
+
+model Vehicle {
+  id              String        @id @default(uuid())
+  model           String
+  plateNumber     String        @unique
+  type            String // e.g. "Bus", "Van", "Sedan"
+  capacity        Int
+  year            Int?
+  fuelType        String? // e.g. "Diesel", "Gasoline"
+  odometerCurrent Int?
+  imageUrl        String?
+  status          VehicleStatus @default(ACTIVE)
+
+  // Informational only — the vehicle's usual driver. Trip booking does NOT
+  // use this: any driver may be assigned to any vehicle.
   driverId String? @unique
   driver   User?   @relation("VehicleDriver", fields: [driverId], references: [id])
 
-  trips     Trip[]
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  tripRequests TripRequest[]
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
 
+  @@index([status])
   @@map("vehicles")
 }
 
-model Route {
-  id                String   @id @default(uuid())
-  origin            String
-  destination       String
-  distanceKm        Float?
-  estimatedDuration Int? // in minutes
-  trips             Trip[]
-  createdAt         DateTime @default(now())
+// The core "Trip Ticket" — one requester booking an entire vehicle + driver
+// for a trip, carried through the full approval → dispatch → completion flow.
+model TripRequest {
+  id           String @id @default(uuid())
+  ticketNumber String @unique // e.g. "TT-2026-0001"
 
-  @@map("routes")
+  requesterId String
+  requester   User   @relation("Requester", fields: [requesterId], references: [id])
+
+  departmentId String
+  department   Department @relation(fields: [departmentId], references: [id])
+
+  purpose       String
+  date          DateTime
+  departureTime DateTime
+
+  // WAIT mode: returnTime is required (checked in trip.service.js).
+  // DROP_AND_PICKUP mode: pickupTime is required instead.
+  // Kept nullable in the DB so old trips don't break.
+  serviceMode ServiceMode @default(WAIT)
+  returnTime  DateTime?
+  pickupTime  DateTime?
+
+  // Upload step rule (checked in trip.service.js):
+  // authorizationLetterUrl is required UNLESS isUrgent = true with an urgentReason.
+  isUrgent               Boolean @default(false)
+  urgentReason           String?
+  authorizationLetterUrl String? // uploaded file (PDF/JPG/PNG/DOCX), path/URL stored here
+
+  driverId String
+  driver   User   @relation("DriverTrips", fields: [driverId], references: [id])
+
+  vehicleId String
+  vehicle   Vehicle @relation(fields: [vehicleId], references: [id])
+
+  certifyOfficialBusiness Boolean @default(false)
+  certifyStatementCorrect Boolean @default(false)
+
+  status TripRequestStatus @default(PENDING)
+
+  adminApprovedById String?
+  adminApprovedBy   User?     @relation("AdminApprovals", fields: [adminApprovedById], references: [id])
+  adminApprovedAt   DateTime?
+
+  // Stays null when the Head Driver step was skipped (he is the assigned driver).
+  headDriverApprovedById String?
+  headDriverApprovedBy   User?     @relation("HeadDriverApprovals", fields: [headDriverApprovedById], references: [id])
+  headDriverApprovedAt   DateTime?
+
+  driverAcceptedAt DateTime?
+
+  // Used for rejection by either Admin or Head Driver.
+  rejectedById   String?
+  rejectedBy     User?     @relation("RejectedTrips", fields: [rejectedById], references: [id])
+  rejectedAt     DateTime?
+  rejectedReason String?
+
+  printedAt DateTime? // FIRST time the ticket was printed — never overwritten
+
+  passengers     TripPassenger[]
+  stops          TripStop[]
+  driverDeclines TripDriverDecline[]
+  departure      TripDeparture?
+  arrival        TripReturn?
+  rating         Rating?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([requesterId])
+  @@index([driverId, status]) // overlap check
+  @@index([vehicleId, status]) // overlap check
+  @@index([departmentId])
+  @@index([date])
+  @@index([departureTime]) // overlap check
+  @@map("trip_requests")
 }
 
-model Trip {
-  id             String     @id @default(uuid())
-  routeId        String
-  route          Route      @relation(fields: [routeId], references: [id])
-  vehicleId      String
-  vehicle        Vehicle    @relation(fields: [vehicleId], references: [id])
-  driverId       String
-  driver         User       @relation("DriverTrips", fields: [driverId], references: [id])
-  departureTime  DateTime
-  arrivalTime    DateTime?
-  status         TripStatus @default(SCHEDULED)
-  totalSeats     Int
-  availableSeats Int
-  pricePerSeat   Decimal    @db.Decimal(10, 2)
+// History of drivers who declined a trip. Also used to hide them
+// from the Head Driver's replacement-driver list for that trip.
+model TripDriverDecline {
+  id            String      @id @default(uuid())
+  tripRequestId String
+  tripRequest   TripRequest @relation(fields: [tripRequestId], references: [id], onDelete: Cascade)
 
-  bookings  Booking[]
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
+  driverId String
+  driver   User   @relation("DriverDeclines", fields: [driverId], references: [id])
 
-  @@map("trips")
+  reason     String
+  declinedAt DateTime @default(now())
+
+  @@unique([tripRequestId, driverId]) // a driver can decline the same trip only once
+  @@index([driverId])
+  @@map("trip_driver_declines")
 }
 
-model Booking {
-  id          String        @id @default(uuid())
-  tripId      String
-  trip        Trip          @relation(fields: [tripId], references: [id])
-  passengerId String
-  passenger   User          @relation("PassengerBookings", fields: [passengerId], references: [id])
-  seatNumber  Int?
-  status      BookingStatus @default(PENDING)
-  price       Decimal       @db.Decimal(10, 2)
-  bookedAt    DateTime      @default(now())
+// Passenger names entered on the request — not necessarily app users.
+model TripPassenger {
+  id            String      @id @default(uuid())
+  tripRequestId String
+  tripRequest   TripRequest @relation(fields: [tripRequestId], references: [id], onDelete: Cascade)
+  name          String
 
-  @@map("bookings")
+  @@index([tripRequestId])
+  @@map("trip_passengers")
 }
 
-// Instructor evaluates/trains drivers - adjust fields to match your real workflow
+// Origin / destination / extra stops, in order.
+model TripStop {
+  id            String      @id @default(uuid())
+  tripRequestId String
+  tripRequest   TripRequest @relation(fields: [tripRequestId], references: [id], onDelete: Cascade)
+  type          StopType
+  address       String // display text (copy of Location.name when a location is picked)
+  order         Int // 0 = origin, then stops in sequence, last = destination
+
+  // Picked from the Admin-managed list. Null when the requester chose "Other".
+  locationId String?
+  location   Location? @relation(fields: [locationId], references: [id])
+
+  // SNAPSHOT of the one-way travel time used for this trip, in minutes:
+  // copied from Location when picked, or typed by the requester for "Other".
+  // Stored so editing a Location later never changes the busy windows of
+  // trips that were already approved. Always 0 for the ORIGIN (base).
+  travelMinutes Int @default(0)
+
+  @@index([tripRequestId])
+  @@index([locationId])
+  @@map("trip_stops")
+}
+
+// Recorded once, when the vehicle leaves the garage.
+model TripDeparture {
+  id            String      @id @default(uuid())
+  tripRequestId String      @unique
+  tripRequest   TripRequest @relation(fields: [tripRequestId], references: [id], onDelete: Cascade)
+
+  departureTime DateTime
+  odometerStart Int
+
+  fuelBalanceInTank    Float // liters already in tank
+  fuelIssuedByOffice   Float // liters issued by the office
+  fuelPurchasedDuring  Float // liters purchased during trip prep
+  totalAvailableLiters Float // sum of the three above, kept explicit for easy display
+
+  recordedAt DateTime @default(now())
+
+  @@map("trip_departures")
+}
+
+// Recorded once, when the vehicle returns.
+model TripReturn {
+  id            String      @id @default(uuid())
+  tripRequestId String      @unique
+  tripRequest   TripRequest @relation(fields: [tripRequestId], references: [id], onDelete: Cascade)
+
+  arrivalTime         DateTime
+  odometerEnd         Int
+  distanceTraveledKm  Float
+  gasolineUsedLiters  Float
+  balanceInTankLiters Float
+
+  gearOilUsedLiters        Float?
+  lubricatingOilUsedLiters Float?
+  greaseIssuedLiters       Float?
+
+  remarks    String?
+  recordedAt DateTime @default(now())
+
+  @@map("trip_returns")
+}
+
+// Requester rates the driver after the trip is COMPLETED.
+// comment = the requester's written feedback message.
+model Rating {
+  id            String      @id @default(uuid())
+  tripRequestId String      @unique
+  tripRequest   TripRequest @relation(fields: [tripRequestId], references: [id], onDelete: Cascade)
+
+  raterId String
+  rater   User   @relation("RatingsGiven", fields: [raterId], references: [id])
+
+  ratedUserId String
+  ratedUser   User   @relation("RatingsReceived", fields: [ratedUserId], references: [id])
+
+  score   Int // 1–5
+  comment String?
+
+  createdAt DateTime @default(now())
+
+  @@index([ratedUserId])
+  @@map("ratings")
+}
+
+model Notification {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  message   String
+  isRead    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, isRead])
+  @@map("notifications")
+}
+
+// System-wide notification rules, set from Admin > Settings.
+// Single-row table (not per-user) since these control platform behavior,
+// e.g. "notify driver when assigned" affects every driver, not just one admin.
+model SystemSettings {
+  id                                 String  @id @default(uuid())
+  notifyRequesterOnApprovalRejection Boolean @default(true)
+  notifyDriverWhenAssigned           Boolean @default(true)
+  sendTripCompletionReminder         Boolean @default(true)
+  alertAdminOnOverdueIncompleteTrips Boolean @default(true)
+
+  updatedById String?
+  updatedBy   User?    @relation("SettingsUpdatedBy", fields: [updatedById], references: [id])
+  updatedAt   DateTime @updatedAt
+
+  @@map("system_settings")
+}
+
+// Instructor evaluates/trains drivers — kept from the earlier draft.
+// Role no longer includes INSTRUCTOR; revisit if/when this workflow returns.
 model TrainingRecord {
   id             String   @id @default(uuid())
   driverId       String
