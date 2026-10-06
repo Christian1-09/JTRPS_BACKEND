@@ -1,6 +1,7 @@
 const prisma = require("../config/prisma");
 const storageService = require("./storage.service");
 const availability = require("./availability.service");
+const settingsService = require("./settings.service");
 
 const SERVICE_MODES = ["WAIT", "DROP_AND_PICKUP"];
 const DRIVER_ROLES = ["DRIVER", "HEAD_DRIVER"]; // the Head Driver also drives
@@ -8,6 +9,7 @@ const BOOKABLE_VEHICLE_STATUSES = ["ACTIVE", "ON_TRIP"]; // ON_TRIP now may stil
 const MIN_TRAVEL_MINUTES = 1;
 const MAX_TRAVEL_MINUTES = 24 * 60;
 const MAX_TICKET_RETRIES = 3;
+const ON_TIME_GRACE_MINUTES = 15;
 
 function httpError(status, message) {
   const err = new Error(message);
@@ -190,8 +192,16 @@ const tripInclude = {
   passengers: true,
   stops: { orderBy: { order: "asc" }, include: { location: true } },
   department: true,
-  driver: { select: { id: true, fullName: true, email: true } },
-  vehicle: { select: { id: true, model: true, plateNumber: true } },
+  requester: { select: { id: true, fullName: true, email: true, phone: true } },
+  driver: { select: { id: true, fullName: true, email: true, phone: true, role: true } },
+  vehicle: {
+    select: { id: true, model: true, plateNumber: true, type: true, odometerCurrent: true },
+  },
+  departure: true,
+  arrival: true,
+  rating: true,
+  adminApprovedBy: { select: { id: true, fullName: true } },
+  headDriverApprovedBy: { select: { id: true, fullName: true } },
 };
 
 async function createTripRequest({
@@ -394,11 +404,379 @@ async function listAvailableVehicles(query = {}) {
   return vehicles.filter((v) => !busy.has(v.id));
 }
 
+async function listDriverDirectory() {
+  const drivers = await prisma.user.findMany({
+    where: {
+      role: { in: ["DRIVER", "HEAD_DRIVER"] },
+      // Deactivated or not-yet-approved drivers can't be booked, so showing
+      // them here would only mislead the requester.
+      isActive: true,
+      isApproved: true,
+    },
+    select: {
+      id: true,
+      fullName: true,
+      avatarUrl: true,
+      role: true,
+      driverProfile: {
+        select: { driverCode: true, status: true },
+      },
+    },
+    orderBy: { fullName: "asc" },
+  });
+
+  if (drivers.length === 0) return [];
+
+  const driverIds = drivers.map((d) => d.id);
+
+  const [tripCounts, ratingAggregates] = await Promise.all([
+    prisma.tripRequest.groupBy({
+      by: ["driverId"],
+      where: { driverId: { in: driverIds }, status: "COMPLETED" },
+      _count: { _all: true },
+    }),
+    // There is no stored average on DriverProfile, so it's computed from
+    // the ratings table. @@index([ratedUserId]) makes this cheap.
+    prisma.rating.groupBy({
+      by: ["ratedUserId"],
+      where: { ratedUserId: { in: driverIds } },
+      _avg: { score: true },
+      _count: { _all: true },
+    }),
+  ]);
+
+  const tripsByDriver = new Map(
+    tripCounts.map((row) => [row.driverId, row._count._all])
+  );
+  const ratingByDriver = new Map(
+    ratingAggregates.map((row) => [row.ratedUserId, row])
+  );
+
+  return drivers.map((driver) => {
+    const rating = ratingByDriver.get(driver.id);
+    return {
+      id: driver.id,
+      fullName: driver.fullName,
+      avatarUrl: driver.avatarUrl,
+      role: driver.role,
+      driverCode: driver.driverProfile?.driverCode ?? null,
+      // A driver row with no profile shouldn't read as "AVAILABLE" —
+      // that would invite a booking that the availability check rejects.
+      status: driver.driverProfile?.status ?? "OFF_DUTY",
+      completedTrips: tripsByDriver.get(driver.id) ?? 0,
+      averageRating: rating?._avg.score ?? null,
+      ratingCount: rating?._count._all ?? 0,
+    };
+  });
+}
+
+/// The fleet as a requester should see it.
+///
+/// INACTIVE (retired) vehicles are hidden; MAINTENANCE ones are kept so the
+/// requester understands why the fleet looks smaller than usual today.
+async function listVehicleDirectory() {
+  return prisma.vehicle.findMany({
+    where: { status: { not: "INACTIVE" } },
+    select: {
+      id: true,
+      model: true,
+      plateNumber: true,
+      type: true,
+      capacity: true,
+      year: true,
+      fuelType: true,
+      imageUrl: true,
+      status: true,
+    },
+    orderBy: [{ status: "asc" }, { model: "asc" }],
+  });
+}
+
+
+
+// ------------------------------------------------------
+// One trip, and rating it afterwards
+// ------------------------------------------------------
+
+// The requester, the assigned driver, the admin and the head driver may
+// open a trip. Anyone else gets a 404 rather than a 403, so trip ids
+// cannot be probed.
+function assertCanView(user, trip) {
+  const allowed =
+    trip.requesterId === user.sub ||
+    trip.driverId === user.sub ||
+    user.role === "ADMIN" ||
+    user.role === "HEAD_DRIVER";
+
+  if (!allowed) {
+    throw httpError(404, "Trip not found");
+  }
+}
+
+async function getTripForUser(user, tripId) {
+  const trip = await prisma.tripRequest.findUnique({
+    where: { id: tripId },
+    include: tripInclude,
+  });
+
+  if (!trip) {
+    throw httpError(404, "Trip not found");
+  }
+  assertCanView(user, trip);
+  return trip;
+}
+
+// A trip counts as on time if it left within this many minutes of the
+// scheduled departure. Campus trips wait for passengers, so a hard
+// zero-minute rule would score every driver near 0%.
+
+/// Everything the requester's driver detail screen shows.
+///
+/// Home address is deliberately NOT returned. Phone and email are, so a
+/// requester can reach the driver about a trip.
+async function getDriverDetail(driverId) {
+  const driver = await prisma.user.findFirst({
+    where: {
+      id: driverId,
+      role: { in: ["DRIVER", "HEAD_DRIVER"] },
+      isActive: true,
+      isApproved: true,
+    },
+    select: {
+      id: true,
+      fullName: true,
+      email: true,
+      phone: true,
+      avatarUrl: true,
+      role: true,
+      driverProfile: {
+        select: {
+          driverCode: true,
+          employeeId: true,
+          status: true,
+          dateHired: true,
+          incidentCount: true,
+        },
+      },
+      vehicleAssignments: {
+        orderBy: [{ isPrimary: "desc" }, { assignedAt: "asc" }],
+        select: {
+          isPrimary: true,
+          vehicle: {
+            select: {
+              id: true,
+              model: true,
+              plateNumber: true,
+              type: true,
+              imageUrl: true,
+              status: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  // Same 404 whether the id is unknown or the driver is deactivated — a
+  // requester has no business distinguishing those.
+  if (!driver) {
+    const err = new Error("Driver not found.");
+    err.status = 404;
+    throw err;
+  }
+
+  const [trips, ratingAggregate] = await Promise.all([
+    // One query serves three of the four stat columns: trip count,
+    // kilometres driven and the on-time percentage.
+    prisma.tripRequest.findMany({
+      where: { driverId, status: "COMPLETED" },
+      select: {
+        departureTime: true,                              // scheduled
+        departure: { select: { departureTime: true } },   // actual
+        arrival: { select: { distanceTraveledKm: true } },
+      },
+    }),
+    prisma.rating.aggregate({
+      where: { ratedUserId: driverId },
+      _avg: { score: true },
+      _count: { _all: true },
+    }),
+  ]);
+
+  let kilometresDriven = 0;
+  let departuresRecorded = 0;
+  let onTimeDepartures = 0;
+
+  for (const trip of trips) {
+    kilometresDriven += trip.arrival?.distanceTraveledKm ?? 0;
+
+    if (trip.departure) {
+      departuresRecorded += 1;
+      const scheduled = new Date(trip.departureTime).getTime();
+      const actual = new Date(trip.departure.departureTime).getTime();
+      if (actual - scheduled <= ON_TIME_GRACE_MINUTES * 60 * 1000) {
+        onTimeDepartures += 1;
+      }
+    }
+  }
+
+  return {
+    id: driver.id,
+    fullName: driver.fullName,
+    email: driver.email,
+    phone: driver.phone,
+    avatarUrl: driver.avatarUrl,
+    role: driver.role,
+
+    driverCode: driver.driverProfile?.driverCode ?? null,
+    employeeId: driver.driverProfile?.employeeId ?? null,
+    status: driver.driverProfile?.status ?? "OFF_DUTY",
+    dateHired: driver.driverProfile?.dateHired ?? null,
+
+    completedTrips: trips.length,
+    // One decimal; the odometer readings don't justify more.
+    kilometresDriven: Math.round(kilometresDriven * 10) / 10,
+    incidentCount: driver.driverProfile?.incidentCount ?? 0,
+
+    // Null, not 0, when no departure has ever been recorded — "0% on time"
+    // would be a lie about a driver who simply has no history yet.
+    onTimePercentage:
+      departuresRecorded === 0
+        ? null
+        : Math.round((onTimeDepartures / departuresRecorded) * 100),
+
+    averageRating: ratingAggregate._avg.score ?? null,
+    ratingCount: ratingAggregate._count._all ?? 0,
+
+    assignedVehicles: driver.vehicleAssignments.map((a) => ({
+      id: a.vehicle.id,
+      model: a.vehicle.model,
+      plateNumber: a.vehicle.plateNumber,
+      type: a.vehicle.type,
+      imageUrl: a.vehicle.imageUrl,
+      status: a.vehicle.status,
+      isPrimary: a.isPrimary,
+    })),
+  };
+}
+
+// The requester rates the driver once, after the trip is completed.
+// comment is their written feedback.
+async function rateTrip(requesterId, tripId, { score, comment }) {
+  const parsedScore = typeof score === "string" ? Number(score.trim()) : score;
+  if (!Number.isInteger(parsedScore) || parsedScore < 1 || parsedScore > 5) {
+    throw httpError(400, "score must be a whole number from 1 to 5");
+  }
+
+  return prisma.$transaction(async (tx) => {
+    const trip = await tx.tripRequest.findUnique({
+      where: { id: tripId },
+      select: {
+        id: true,
+        ticketNumber: true,
+        requesterId: true,
+        driverId: true,
+        status: true,
+        rating: { select: { id: true } },
+      },
+    });
+
+    if (!trip || trip.requesterId !== requesterId) {
+      throw httpError(404, "Trip not found");
+    }
+    if (trip.status !== "COMPLETED") {
+      throw httpError(400, "You can rate the driver once the trip is completed");
+    }
+    if (trip.rating) {
+      throw httpError(409, "You already rated this trip");
+    }
+
+    const cleanComment = String(comment || "").trim() || null;
+
+    const rating = await tx.rating.create({
+      data: {
+        tripRequestId: tripId,
+        raterId: requesterId,
+        ratedUserId: trip.driverId,
+        score: parsedScore,
+        comment: cleanComment,
+      },
+    });
+
+    await tx.notification.create({
+      data: {
+        userId: trip.driverId,
+        title: "New Rating Received",
+        message: cleanComment
+          ? `You received ${parsedScore} of 5 for trip ${trip.ticketNumber}: ${cleanComment}`
+          : `You received ${parsedScore} of 5 for trip ${trip.ticketNumber}.`,
+      },
+    });
+
+    return rating;
+  });
+}
+
+
+// The requester, the assigned driver and the admin may print a completed
+// ticket. printedAt keeps the FIRST print only and is never overwritten.
+async function markPrinted(user, tripId) {
+  const trip = await prisma.tripRequest.findUnique({
+    where: { id: tripId },
+    include: tripInclude,
+  });
+
+  if (!trip) {
+    throw httpError(404, "Trip not found");
+  }
+
+  const allowed =
+    trip.requesterId === user.sub || trip.driverId === user.sub || user.role === "ADMIN";
+  if (!allowed) {
+    throw httpError(404, "Trip not found");
+  }
+
+  if (trip.status !== "COMPLETED") {
+    throw httpError(400, "Only completed trips can be printed");
+  }
+
+  // The approver line on the printed ticket comes from the admin-editable
+  // settings, so every role gets it with the same call.
+  const settings = await settingsService.getSettings();
+
+  if (trip.printedAt) return { trip, settings };
+
+  const updated = await prisma.tripRequest.update({
+    where: { id: tripId },
+    data: { printedAt: new Date() },
+    include: tripInclude,
+  });
+
+  return { trip: updated, settings };
+}
+// A trip counts as on time if it left within this many minutes of the
+// scheduled departure. Campus trips wait for passengers, so a hard
+// zero-minute rule would score every driver near 0%.
+
+
+/// Everything the requester's driver detail screen shows.
+///
+/// Home address is deliberately NOT returned. Phone and email are, so a
+/// requester can reach the driver about a trip.
+
+
+
 module.exports = {
   createTripRequest,
+  markPrinted,
+  getTripForUser,
+  getDriverDetail,
+  rateTrip,
   listMyTrips,
   listDepartments,
   listLocations,
   listAvailableDrivers,
   listAvailableVehicles,
+  listDriverDirectory,
+  listVehicleDirectory,
 };

@@ -275,7 +275,13 @@ async function listDrivers({ status } = {}) {
       avatarUrl: true,
       createdAt: true,
       driverProfile: true,
-      ownedVehicle: { select: { id: true, model: true, plateNumber: true } },
+      vehicleAssignments: {
+        orderBy: [{ isPrimary: "desc" }, { assignedAt: "asc" }],
+        select: {
+          isPrimary: true,
+          vehicle: { select: { id: true, model: true, plateNumber: true } },
+        },
+      },
     },
     orderBy: [{ role: "asc" }, { fullName: "asc" }],
   });
@@ -324,7 +330,28 @@ async function listDrivers({ status } = {}) {
       status: driver.driverProfile?.status ?? null,
       licenseNumber: driver.driverProfile?.licenseNumber ?? null,
       dateHired: driver.driverProfile?.dateHired ?? null,
-      assignedVehicle: driver.ownedVehicle ?? null,
+           // The full list, now that a driver can have several vehicles.
+      assignedVehicles: driver.vehicleAssignments.map((a) => ({
+        id: a.vehicle.id,
+        model: a.vehicle.model,
+        plateNumber: a.vehicle.plateNumber,
+        isPrimary: a.isPrimary,
+      })),
+
+      // Kept so the existing admin Drivers table keeps rendering without a
+      // Flutter change. It's the primary vehicle, or the first assigned one.
+      // Delete this once that screen reads assignedVehicles instead.
+      assignedVehicle: driver.vehicleAssignments.length > 0
+        ? {
+            id: driver.vehicleAssignments[0].vehicle.id,
+            model: driver.vehicleAssignments[0].vehicle.model,
+            plateNumber: driver.vehicleAssignments[0].vehicle.plateNumber,
+          }
+        : null,
+      // New DriverProfile fields, while we're here.
+      employeeId: driver.driverProfile?.employeeId ?? null,
+      incidentCount: driver.driverProfile?.incidentCount ?? 0,
+
       totalTrips: totalByDriver.get(driver.id) ?? 0,
       completedTrips: doneByDriver.get(driver.id) ?? 0,
       averageRating: rating?.avg ?? null,
@@ -393,6 +420,363 @@ async function setDriverStatus(userId, status) {
   return updated;
 }
 
+
+// ------------------------------------------------------
+// Trip Ticket Log — every trip, filterable
+// ------------------------------------------------------
+
+const LOG_STATUSES = [
+  "PENDING",
+  "ADMIN_APPROVED",
+  "HEAD_DRIVER_APPROVED",
+  "DRIVER_ACCEPTED",
+  "DRIVER_DECLINED",
+  "REJECTED",
+  "ONGOING",
+  "COMPLETED",
+];
+
+const MAX_LOG_PAGE = 200;
+
+function parseDate(value, field) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw httpError(400, `${field} is not a valid date`);
+  }
+  return date;
+}
+
+// The whole history, not just pending. Paged because this list only grows.
+async function listAllTrips(query = {}) {
+  const { status, departmentId, search, from, to, printed } = query;
+
+  const take = Math.min(Number(query.limit) || 50, MAX_LOG_PAGE);
+  const skip = Math.max(Number(query.offset) || 0, 0);
+
+  if (status && !LOG_STATUSES.includes(status)) {
+    throw httpError(400, `status must be one of: ${LOG_STATUSES.join(", ")}`);
+  }
+
+  const fromDate = parseDate(from, "from");
+  const toDate = parseDate(to, "to");
+
+  const where = {
+    ...(status ? { status } : {}),
+    ...(departmentId ? { departmentId } : {}),
+    ...(printed === "true" ? { printedAt: { not: null } } : {}),
+    ...(printed === "false" ? { printedAt: null } : {}),
+    ...(fromDate || toDate
+      ? {
+          date: {
+            ...(fromDate ? { gte: fromDate } : {}),
+            ...(toDate ? { lte: toDate } : {}),
+          },
+        }
+      : {}),
+    ...(search && search.trim()
+      ? {
+          OR: [
+            { ticketNumber: { contains: search.trim(), mode: "insensitive" } },
+            { purpose: { contains: search.trim(), mode: "insensitive" } },
+            { requester: { fullName: { contains: search.trim(), mode: "insensitive" } } },
+            { driver: { fullName: { contains: search.trim(), mode: "insensitive" } } },
+            { vehicle: { plateNumber: { contains: search.trim(), mode: "insensitive" } } },
+          ],
+        }
+      : {}),
+  };
+
+  const [trips, total] = await Promise.all([
+    prisma.tripRequest.findMany({
+      where,
+      include: {
+        requester: { select: { id: true, fullName: true, email: true, phone: true } },
+        department: true,
+        driver: { select: { id: true, fullName: true, phone: true, role: true } },
+        vehicle: true,
+        passengers: true,
+        stops: { orderBy: { order: "asc" }, include: { location: true } },
+        departure: true,
+        arrival: true,
+        rating: true,
+      },
+      orderBy: [{ date: "desc" }, { createdAt: "desc" }],
+      take,
+      skip,
+    }),
+    prisma.tripRequest.count({ where }),
+  ]);
+
+  return { trips, total, limit: take, offset: skip };
+}
+
+// ------------------------------------------------------
+// Vehicle status (Admin)
+// ------------------------------------------------------
+// Lives here rather than in vehicle.service.js only because this endpoint
+// was added later; it can be moved there without changing behaviour.
+
+const ADMIN_SETTABLE_VEHICLE_STATUSES = ["ACTIVE", "MAINTENANCE", "INACTIVE"];
+
+async function setVehicleStatus(vehicleId, status) {
+  if (!ADMIN_SETTABLE_VEHICLE_STATUSES.includes(status)) {
+    throw httpError(
+      400,
+      `status must be one of: ${ADMIN_SETTABLE_VEHICLE_STATUSES.join(", ")}. ON_TRIP is set automatically when a trip departs.`
+    );
+  }
+
+  const vehicle = await prisma.vehicle.findUnique({ where: { id: vehicleId } });
+  if (!vehicle) {
+    throw httpError(404, "Vehicle not found");
+  }
+
+  // A vehicle out on the road cannot be parked in maintenance — its return
+  // log still has to be recorded against it.
+  const ongoing = await prisma.tripRequest.findFirst({
+    where: { vehicleId, status: "ONGOING" },
+    select: { ticketNumber: true },
+  });
+  if (ongoing) {
+    throw httpError(
+      409,
+      `${vehicle.model} (${vehicle.plateNumber}) is on trip ${ongoing.ticketNumber} and its status cannot be changed yet.`
+    );
+  }
+
+  const updated = await prisma.vehicle.update({
+    where: { id: vehicleId },
+    data: { status },
+  });
+
+  // Trips already booked on this vehicle are NOT cancelled — the admin is
+  // told which ones are affected so they can reassign or reject them.
+  let affectedTrips = [];
+  if (status !== "ACTIVE") {
+    affectedTrips = await prisma.tripRequest.findMany({
+      where: {
+        vehicleId,
+        status: {
+          in: ["PENDING", "ADMIN_APPROVED", "HEAD_DRIVER_APPROVED", "DRIVER_ACCEPTED"],
+        },
+        departureTime: { gte: new Date() },
+      },
+      select: {
+        id: true,
+        ticketNumber: true,
+        departureTime: true,
+        requester: { select: { fullName: true } },
+      },
+      orderBy: { departureTime: "asc" },
+    });
+  }
+
+  return { vehicle: updated, affectedTrips };
+}
+
+
+// Edit a vehicle's details. The photo is not changed here — that needs a
+// multipart upload, which the create endpoint already handles.
+async function updateVehicle(vehicleId, body) {
+  const vehicle = await prisma.vehicle.findUnique({ where: { id: vehicleId } });
+  if (!vehicle) {
+    throw httpError(404, "Vehicle not found");
+  }
+
+  const data = {};
+
+  function text(field, { maxLength = 60, required = false } = {}) {
+    if (body[field] === undefined) return;
+    const value = String(body[field] ?? "").trim().replace(/\s+/g, " ");
+    if (!value) {
+      if (required) throw httpError(400, `${field} cannot be empty`);
+      data[field] = null;
+      return;
+    }
+    if (value.length > maxLength) {
+      throw httpError(400, `${field} must be ${maxLength} characters or less`);
+    }
+    data[field] = value;
+  }
+
+  function integer(field, { min = 0, max = 10_000_000 } = {}) {
+    if (body[field] === undefined) return;
+    const raw = body[field];
+    if (raw === null || raw === "") {
+      data[field] = null;
+      return;
+    }
+    const num = typeof raw === "string" ? Number(raw.trim()) : raw;
+    if (!Number.isInteger(num) || num < min || num > max) {
+      throw httpError(400, `${field} must be a whole number from ${min} to ${max}`);
+    }
+    data[field] = num;
+  }
+
+  text("model", { required: true });
+  text("type", { required: true });
+  text("fuelType");
+  integer("capacity", { min: 1, max: 200 });
+  integer("year", { min: 1950, max: new Date().getFullYear() + 1 });
+  integer("odometerCurrent");
+
+  if (body.plateNumber !== undefined) {
+    const plate = String(body.plateNumber ?? "").trim().toUpperCase();
+    if (!plate) throw httpError(400, "plateNumber cannot be empty");
+
+    const duplicate = await prisma.vehicle.findFirst({
+      where: {
+        plateNumber: { equals: plate, mode: "insensitive" },
+        NOT: { id: vehicleId },
+      },
+      select: { id: true },
+    });
+    if (duplicate) {
+      throw httpError(409, `Another vehicle already uses plate number ${plate}`);
+    }
+    data.plateNumber = plate;
+  }
+
+  if (Object.keys(data).length === 0) {
+    throw httpError(400, "No vehicle fields were provided to update");
+  }
+
+  try {
+    return await prisma.vehicle.update({ where: { id: vehicleId }, data });
+  } catch (err) {
+    if (err?.code === "P2002") {
+      throw httpError(409, "Another vehicle already uses that plate number");
+    }
+    throw err;
+  }
+}
+
+// Only a vehicle that has never been used can be deleted. One with trips
+// must be deactivated instead, or its trip history would be orphaned.
+async function deleteVehicle(vehicleId) {
+  const vehicle = await prisma.vehicle.findUnique({
+    where: { id: vehicleId },
+    include: { _count: { select: { tripRequests: true } } },
+  });
+
+  if (!vehicle) {
+    throw httpError(404, "Vehicle not found");
+  }
+
+  if (vehicle._count.tripRequests > 0) {
+    throw httpError(
+      409,
+      `${vehicle.model} (${vehicle.plateNumber}) has ${vehicle._count.tripRequests} trip(s) on record and cannot be deleted. Set it to Inactive instead.`
+    );
+  }
+
+  await prisma.vehicle.delete({ where: { id: vehicleId } });
+}
+/// Replaces a vehicle's whole driver list in one call.
+///
+/// Idempotent by design: the caller sends the complete desired set and the
+/// server makes reality match. That's easier to reason about than add/remove
+/// calls, and it can't drift if a request is retried.
+async function setVehicleDrivers(vehicleId, assignments) {
+  const vehicle = await prisma.vehicle.findUnique({ where: { id: vehicleId } });
+  if (!vehicle) {
+    const err = new Error("Vehicle not found.");
+    err.status = 404;
+    throw err;
+  }
+
+  const list = Array.isArray(assignments) ? assignments : [];
+
+  // Drop duplicate driverIds — the unique constraint would reject them and
+  // the admin almost certainly meant one row.
+  const seen = new Set();
+  const cleaned = [];
+  for (const item of list) {
+    const driverId = item?.driverId;
+    if (!driverId || seen.has(driverId)) continue;
+    seen.add(driverId);
+    cleaned.push({ driverId, isPrimary: item.isPrimary === true });
+  }
+
+  if (cleaned.filter((a) => a.isPrimary).length > 1) {
+    const err = new Error("Only one driver can be the primary for a vehicle.");
+    err.status = 400;
+    throw err;
+  }
+
+  if (cleaned.length > 0) {
+    const validDrivers = await prisma.user.findMany({
+      where: {
+        id: { in: cleaned.map((a) => a.driverId) },
+        role: { in: ["DRIVER", "HEAD_DRIVER"] },
+        isActive: true,
+        isApproved: true,
+      },
+      select: { id: true },
+    });
+
+    if (validDrivers.length !== cleaned.length) {
+      const err = new Error(
+        "One or more selected users are not approved, active drivers."
+      );
+      err.status = 400;
+      throw err;
+    }
+  }
+
+  // Replace the set atomically, so a failure can't leave the vehicle with
+  // no drivers at all.
+  await prisma.$transaction([
+    prisma.vehicleAssignment.deleteMany({ where: { vehicleId } }),
+    ...(cleaned.length === 0
+      ? []
+      : [
+          prisma.vehicleAssignment.createMany({
+            data: cleaned.map((a) => ({
+              vehicleId,
+              driverId: a.driverId,
+              isPrimary: a.isPrimary,
+            })),
+          }),
+        ]),
+  ]);
+
+  return listVehicleDrivers(vehicleId);
+}
+
+async function listVehicleDrivers(vehicleId) {
+  const rows = await prisma.vehicleAssignment.findMany({
+    where: { vehicleId },
+    orderBy: [{ isPrimary: "desc" }, { assignedAt: "asc" }],
+    select: {
+      isPrimary: true,
+      driver: {
+        select: {
+          id: true,
+          fullName: true,
+          avatarUrl: true,
+          role: true,
+          driverProfile: { select: { driverCode: true, status: true } },
+        },
+      },
+    },
+  });
+
+  return rows.map((row) => ({
+    id: row.driver.id,
+    fullName: row.driver.fullName,
+    avatarUrl: row.driver.avatarUrl,
+    role: row.driver.role,
+    driverCode: row.driver.driverProfile?.driverCode ?? null,
+    status: row.driver.driverProfile?.status ?? "OFF_DUTY",
+    isPrimary: row.isPrimary,
+  }));
+}
+
+
+
+
 module.exports = {
   listPendingDrivers,
   approveDriver,
@@ -401,6 +785,11 @@ module.exports = {
   listDrivers,
   setDriverStatus,
   listPendingTrips,
+  listAllTrips,
   approveTrip,
   rejectTrip,
+  setVehicleStatus,
+  updateVehicle,
+  deleteVehicle,
+  setVehicleDrivers,
 };

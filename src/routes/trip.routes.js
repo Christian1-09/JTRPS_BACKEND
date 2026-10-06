@@ -20,5 +20,16 @@ router.get("/departments", authenticate, tripController.listDepartments);
 router.get("/locations", authenticate, tripController.listLocations);
 router.get("/drivers/available", authenticate, tripController.listAvailableDrivers);
 router.get("/vehicles/available", authenticate, tripController.listAvailableVehicles);
+router.get("/drivers/directory",authenticate,tripController.listDriverDirectory);
+router.get("/drivers/:driverId", authenticate, tripController.getDriverDetail);
+router.get("/vehicles/directory",authenticate,tripController.listVehicleDirectory);
+
+// ":id" routes go last so "mine", "departments", "locations" are never
+// mistaken for a trip id.
+router.get("/:id", authenticate, tripController.getTrip);
+router.post("/:id/rating", authenticate, tripController.rateTrip);
+router.post("/:id/print", authenticate, tripController.printTrip);
+
+
 
 module.exports = router;

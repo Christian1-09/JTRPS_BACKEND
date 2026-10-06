@@ -11,7 +11,7 @@ async function listAllVehicles(req, res, next) {
 
 async function createVehicle(req, res, next) {
   try {
-    const { model, plateNumber, type, capacity, year, odometerCurrent } = req.body;
+    const { model, plateNumber, type, capacity, year, odometerCurrent,assignments } = req.body;
 
     if (!model || !plateNumber || !type || !capacity) {
       return res.status(400).json({
@@ -29,6 +29,7 @@ async function createVehicle(req, res, next) {
       year,
       odometerCurrent,
       imageFile,
+      assignments,
     });
 
     res.status(201).json({ vehicle });

@@ -102,6 +102,64 @@ async function rejectTrip(req, res, next) {
   }
 }
 
+
+// GET /api/admin/trips
+// query: status, departmentId, search, from, to, printed, limit, offset
+async function listAllTrips(req, res, next) {
+  try {
+    const result = await adminService.listAllTrips(req.query);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// PATCH /api/admin/vehicles/:id/status   body: { status }
+async function setVehicleStatus(req, res, next) {
+  try {
+    const { status } = req.body;
+    if (!status) {
+      return res.status(400).json({ message: "status is required" });
+    }
+    const result = await adminService.setVehicleStatus(req.params.id, status);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+
+// PATCH /api/admin/vehicles/:id
+async function updateVehicle(req, res, next) {
+  try {
+    const vehicle = await adminService.updateVehicle(req.params.id, req.body);
+    res.json({ vehicle });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// DELETE /api/admin/vehicles/:id
+async function deleteVehicle(req, res, next) {
+  try {
+    await adminService.deleteVehicle(req.params.id);
+    res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+}
+async function setVehicleDrivers(req, res, next) {
+  try {
+    const drivers = await adminService.setVehicleDrivers(
+      req.params.id,
+      req.body.assignments
+    );
+    res.json({ drivers });
+  } catch (err) {
+    next(err);
+  }
+}
+
 module.exports = {
   listPendingDrivers,
   listDrivers,
@@ -110,6 +168,11 @@ module.exports = {
   rejectDriver,
   updateUserRole,
   listPendingTrips,
+  listAllTrips,
   approveTrip,
   rejectTrip,
+  setVehicleStatus,
+  updateVehicle,
+  deleteVehicle,
+  setVehicleDrivers
 };

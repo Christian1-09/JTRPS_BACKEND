@@ -85,7 +85,7 @@ model User {
   requestedTrips TripRequest[] @relation("Requester")
   driverTrips    TripRequest[] @relation("DriverTrips")
 
-  ownedVehicle Vehicle? @relation("VehicleDriver")
+  vehicleAssignments VehicleAssignment[] @relation("VehicleAssignments")
 
   adminApprovals      TripRequest[] @relation("AdminApprovals")
   headDriverApprovals TripRequest[] @relation("HeadDriverApprovals")
@@ -122,6 +122,9 @@ model DriverProfile {
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
 
+  employeeId    String?      @unique   // e.g. "EMP-2019-0042", set by Admin
+  incidentCount Int          @default(0)
+  
   @@index([status])
   @@map("driver_profiles")
 }
@@ -186,9 +189,7 @@ model Vehicle {
 
   // Informational only — the vehicle's usual driver. Trip booking does NOT
   // use this: any driver may be assigned to any vehicle.
-  driverId String? @unique
-  driver   User?   @relation("VehicleDriver", fields: [driverId], references: [id])
-
+  assignments VehicleAssignment[]
   tripRequests TripRequest[]
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
@@ -196,6 +197,35 @@ model Vehicle {
   @@index([status])
   @@map("vehicles")
 }
+
+// A vehicle may be assigned to many drivers, and a driver to many vehicles.
+// Replaces the old one-to-one Vehicle.driverId.
+//
+// This is informational: trip booking still allows ANY driver on ANY
+// vehicle. It records who usually drives what.
+model VehicleAssignment {
+  id        String  @id @default(uuid())
+
+  vehicleId String
+  vehicle   Vehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  driverId  String
+  driver    User    @relation("VehicleAssignments", fields: [driverId], references: [id], onDelete: Cascade)
+
+  // Exactly one assignment per vehicle may be primary. Enforced in the
+  // service, not the database — Postgres can't express "at most one true
+  // per group" without a partial unique index.
+  isPrimary Boolean @default(false)
+
+  assignedAt DateTime @default(now())
+
+  // One row per vehicle+driver pair; assigning twice is a no-op, not a
+  // duplicate.
+  @@unique([vehicleId, driverId])
+  @@index([driverId])
+  @@map("vehicle_assignments")
+}
+
 
 // The core "Trip Ticket" — one requester booking an entire vehicle + driver
 // for a trip, carried through the full approval → dispatch → completion flow.
@@ -360,6 +390,12 @@ model TripReturn {
   gasolineUsedLiters  Float
   balanceInTankLiters Float
 
+  // Items 2 and 3 of the printed trip ticket. In WAIT mode these are the
+  // arrival at and departure from the destination; in DROP_AND_PICKUP mode
+  // they are the drop-off and the pick-up. Nullable so older trips stay valid.
+  arrivedAtDestination    DateTime?
+  departedFromDestination DateTime?
+
   gearOilUsedLiters        Float?
   lubricatingOilUsedLiters Float?
   greaseIssuedLiters       Float?
@@ -414,6 +450,11 @@ model SystemSettings {
   notifyDriverWhenAssigned           Boolean @default(true)
   sendTripCompletionReminder         Boolean @default(true)
   alertAdminOnOverdueIncompleteTrips Boolean @default(true)
+
+  // Printed on the trip ticket's "Approved:" line. Editable by the Admin so
+  // it keeps working when the GSO head changes.
+  approverName  String?
+  approverTitle String? @default("Administrative Officer V/GSO Unit Head")
 
   updatedById String?
   updatedBy   User?    @relation("SettingsUpdatedBy", fields: [updatedById], references: [id])

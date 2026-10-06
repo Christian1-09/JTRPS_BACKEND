@@ -122,11 +122,85 @@ async function listAvailableVehicles(req, res, next) {
   }
 }
 
+
+// GET /api/trips/:id — requester, assigned driver, admin or head driver
+async function getTrip(req, res, next) {
+  try {
+    const trip = await tripService.getTripForUser(req.user, req.params.id);
+    res.json({ trip });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function getDriverDetail(req, res, next) {
+  try {
+    const driver = await tripService.getDriverDetail(req.params.driverId);
+    res.json({ driver });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /api/trips/:id/rating   body: { score, comment }
+async function rateTrip(req, res, next) {
+  try {
+    const { score, comment } = req.body;
+    const rating = await tripService.rateTrip(req.user.sub, req.params.id, { score, comment });
+    res.status(201).json({ rating });
+  } catch (err) {
+    next(err);
+  }
+}
+
+
+// POST /api/trips/:id/print — records the first print, returns the ticket data
+async function printTrip(req, res, next) {
+  try {
+    const { trip, settings } = await tripService.markPrinted(req.user, req.params.id);
+    res.json({
+      trip,
+      approver: {
+        name: settings.approverName,
+        title: settings.approverTitle,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function listDriverDirectory(req, res, next) {
+  try {
+    const drivers = await tripService.listDriverDirectory();
+    res.json({ drivers });          // wrapped, to match /trips/departments
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function listVehicleDirectory(req, res, next) {
+  try {
+    const vehicles = await tripService.listVehicleDirectory();
+    res.json({ vehicles });         // wrapped
+  } catch (err) {
+    next(err);
+  }
+}
+
+
 module.exports = {
   createTripRequest,
+  printTrip,
+  getTrip,
+  getDriverDetail,
+  rateTrip,
   listMyTrips,
   listDepartments,
   listLocations,
   listAvailableDrivers,
   listAvailableVehicles,
+  listDriverDirectory,
+  listVehicleDirectory,
+  
 };
